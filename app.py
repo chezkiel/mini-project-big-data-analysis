@@ -12,44 +12,70 @@ MONGO_URI = os.getenv("MONGO_URI")
 DB_NAME = "cuaca_db"
 COLLECTION_NAME = "data_cuaca"
 
+PULAU_KOTA = {
+    "Sumatera": ["Medan", "Padang", "Palembang"],
+    "Jawa": ["Jakarta", "Bandung", "Surabaya"],
+    "Kalimantan": ["Pontianak", "Banjarmasin", "Samarinda"],
+    "Sulawesi": ["Makassar", "Manado", "Palu"],
+    "Papua": ["Jayapura"],
+    "Bali–Nusa": ["Denpasar", "Mataram"],
+    "Maluku": ["Ambon"]
+}
+
+def get_pulau(city):
+    for pulau, kota_list in PULAU_KOTA.items():
+        if city in kota_list:
+            return pulau
+    return "Lainnya"
+
 def load_data():
     client = MongoClient(MONGO_URI)
     db = client[DB_NAME]
     collection = db[COLLECTION_NAME]
     data = list(collection.find({}))
     df = pd.DataFrame(data)
-    if not df.empty:
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
-        df["timestamp"] = df["timestamp"].dt.tz_convert("Asia/Makassar")
 
-        df["temperature"] = df["temperature"].round().astype(int)
+    if not df.empty:
+        if "local_time" in df.columns:
+            df["timestamp"] = pd.to_datetime(df["local_time"])
+        else:
+            df["timestamp"] = pd.to_datetime("now")
+
+        df["temperature"] = df["temperature"].astype(float).round()
+        df["humidity"] = df["humidity"].astype(int)
+        df["pulau"] = df["city"].apply(get_pulau)
+    
     return df
 
-
 app = dash.Dash(__name__)
-app.title = "Dashboard Cuaca Interaktif"
+app.title = "Dashboard Cuaca Indonesia"
 
 df = load_data()
-nama_kota = df["city"].iloc[0] if not df.empty else "Tidak diketahui"
-last_update = df["timestamp"].max() if not df.empty else None
+start_date = df["timestamp"].min() if not df.empty else None
+end_date = df["timestamp"].max() if not df.empty else None
+available_pulau = sorted(df["pulau"].unique()) if not df.empty else []
 
 app.layout = html.Div([
-    html.H1(f"Dashboard Cuaca - Kota: {nama_kota}"),
-    html.P(id='last-update-text', children=(
-        f"Data terakhir diupdate pada: {last_update.strftime('%Y-%m-%d %H:%M:%S')}"
-        if last_update else "Data tidak tersedia"
-    )),
+    html.H1("Dashboard Cuaca Regional Indonesia"),
+    html.P(id='last-update-text'),
     dcc.DatePickerRange(
         id='date-picker-range',
-        start_date=df["timestamp"].min(),
-        end_date=df["timestamp"].max()
+        start_date=start_date,
+        end_date=end_date
     ),
-    html.Div(id='summary-stats', style={'padding': '20px', 'border': '1px solid #ddd', 'margin-bottom': '20px'}),
+    dcc.Dropdown(
+        id="pulau-dropdown",
+        options=[{"label": p, "value": p} for p in available_pulau],
+        value=available_pulau,
+        multi=True,
+        placeholder="Pilih pulau"
+    ),
+    html.Div(id='summary-stats', style={'padding': '20px', 'border': '1px solid #ccc', 'margin-bottom': '20px'}),
     dcc.Graph(id='line-temp'),
     dcc.Graph(id='line-hum'),
+    dcc.Graph(id='bar-pulau-avg-temp'),
     dcc.Graph(id='bar-weather-freq'),
-    dcc.Graph(id='hist-temp'),
-    dcc.Graph(id='hist-hum'),
+    dcc.Graph(id='heatmap-temp'),
 
     dcc.Interval(
         id='interval-component',
@@ -62,27 +88,31 @@ app.layout = html.Div([
     [Output('summary-stats', 'children'),
      Output('line-temp', 'figure'),
      Output('line-hum', 'figure'),
+     Output('bar-pulau-avg-temp', 'figure'),
      Output('bar-weather-freq', 'figure'),
-     Output('hist-temp', 'figure'),
-     Output('hist-hum', 'figure'),
-     Output('last-update-text', 'children'),
-     Output('date-picker-range', 'start_date'),
-     Output('date-picker-range', 'end_date')],
+     Output('heatmap-temp', 'figure'),
+     Output('last-update-text', 'children')],
     [Input('date-picker-range', 'start_date'),
      Input('date-picker-range', 'end_date'),
+     Input('pulau-dropdown', 'value'),
      Input('interval-component', 'n_intervals')]
 )
-def update_graph(start_date, end_date, n):
+def update_graphs(start_date, end_date, selected_pulau, n):
     df = load_data()
     if df.empty:
-        return html.P("Data tidak tersedia."), {}, {}, {}, {}, {}, "Data tidak tersedia", None, None
+        return html.P("Data tidak tersedia."), {}, {}, {}, {}, {}, "Data tidak tersedia"
 
     start_date = pd.to_datetime(start_date)
     end_date = pd.to_datetime(end_date)
+    if not selected_pulau or len(selected_pulau) == 0:
+        filtered_df = df[(df["timestamp"] >= start_date) & (df["timestamp"] <= end_date)]
+    else:
+        filtered_df = df[(df["timestamp"] >= start_date) & (df["timestamp"] <= end_date) & (df["pulau"].isin(selected_pulau))]
 
-    filtered_df = df[(df["timestamp"] >= start_date) & (df["timestamp"] <= end_date)]
+    if filtered_df.empty:
+        return html.P("Tidak ada data untuk filter tersebut."), {}, {}, {}, {}, {}, ""
 
-    # Statistik deskriptif
+    # Statistik deskriptif suhu & kelembaban (gabungan)
     avg_temp = filtered_df["temperature"].mean()
     min_temp = filtered_df["temperature"].min()
     max_temp = filtered_df["temperature"].max()
@@ -95,27 +125,38 @@ def update_graph(start_date, end_date, n):
 
     summary = html.Div([
         html.H3("Statistik Deskriptif"),
-        html.P(f"Suhu (°C): Rata-rata = {avg_temp:.2f}, Minimum = {min_temp:.2f}, Maksimum = {max_temp:.2f}, Std Dev = {std_temp:.2f}"),
-        html.P(f"Kelembaban (%): Rata-rata = {avg_hum:.2f}, Minimum = {min_hum:.2f}, Maksimum = {max_hum:.2f}, Std Dev = {std_hum:.2f}"),
+        html.P(f"Suhu (°C): Rata-rata = {avg_temp:.2f}, Min = {min_temp:.2f}, Max = {max_temp:.2f}, Std Dev = {std_temp:.2f}"),
+        html.P(f"Kelembaban (%): Rata-rata = {avg_hum:.2f}, Min = {min_hum:.2f}, Max = {max_hum:.2f}, Std Dev = {std_hum:.2f}")
     ])
 
-    fig_temp = px.line(filtered_df, x="timestamp", y="temperature", title="Suhu (°C) dari Waktu ke Waktu")
-    fig_temp.update_layout(yaxis_title='Suhu (°C)')
+    # Grafik Line per pulau (pakai facet_row berdasarkan pulau)
+    fig_temp = px.line(filtered_df, x="timestamp", y="temperature", color="city", facet_row="pulau",
+                       title="Suhu dari Waktu ke Waktu per Pulau",
+                       height=300 * len(selected_pulau) if selected_pulau else 600)
+    fig_temp.update_layout(margin=dict(t=50, b=50))
 
-    fig_hum = px.line(filtered_df, x="timestamp", y="humidity", title="Kelembaban (%) dari Waktu ke Waktu")
-    fig_hum.update_layout(yaxis_title='Kelembaban (%)')
+    fig_hum = px.line(filtered_df, x="timestamp", y="humidity", color="city", facet_row="pulau",
+                      title="Kelembaban dari Waktu ke Waktu per Pulau",
+                      height=300 * len(selected_pulau) if selected_pulau else 600)
+    fig_hum.update_layout(margin=dict(t=50, b=50))
 
-    weather_counts = filtered_df['weather'].value_counts().reset_index()
-    weather_counts.columns = ['Cuaca', 'Frekuensi']
-    fig_weather_freq = px.bar(weather_counts, x='Cuaca', y='Frekuensi', title='Frekuensi Jenis Cuaca')
+    # Bar frekuensi jenis cuaca (filter per pulau)
+    weather_counts = filtered_df["weather"].value_counts().reset_index()
+    weather_counts.columns = ["weather", "count"]
+    fig_weather = px.bar(weather_counts, x="weather", y="count", title="Frekuensi Jenis Cuaca")
 
-    fig_hist_temp = px.histogram(filtered_df, x="temperature", nbins=30, title="Distribusi Suhu")
-    fig_hist_hum = px.histogram(filtered_df, x="humidity", nbins=30, title="Distribusi Kelembaban")
+    # Bar rata-rata suhu per pulau (dari seluruh data tanpa filter)
+    avg_temp_pulau_all = df.groupby("pulau")["temperature"].mean().reset_index()
+    fig_pulau_temp = px.bar(avg_temp_pulau_all, x="pulau", y="temperature", title="Rata-rata Suhu per Pulau (Seluruh Data)")
 
-    last_update = df["timestamp"].max().strftime('%Y-%m-%d %H:%M:%S')
+    # Heatmap suhu kota per waktu (filter per pulau)
+    heatmap_df = filtered_df.pivot_table(index="city", columns="timestamp", values="temperature")
+    fig_heatmap = px.imshow(heatmap_df, aspect="auto", labels=dict(color="Suhu (°C)"), title="Heatmap Suhu per Kota")
+    
+    last_update = filtered_df["timestamp"].max().strftime("%Y-%m-%d %H:%M:%S")
 
-    return summary, fig_temp, fig_hum, fig_weather_freq, fig_hist_temp, fig_hist_hum, \
-        f"Data terakhir diupdate pada: {last_update}", df["timestamp"].min(), df["timestamp"].max()
+    return summary, fig_temp, fig_hum, fig_weather, fig_pulau_temp, fig_heatmap, f"Data terakhir diupdate pada: {last_update}"
+
 
 if __name__ == "__main__":
     app.run(debug=True)
